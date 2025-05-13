@@ -31,12 +31,25 @@ def main():
     df_days_since_prev_trans = df_prev_trans_date.withColumn(
         "days_since_last_trans",
         (F.datediff(F.col("curr_trans_date"), F.col("prev_trans_date"))),
+    ).withColumn("status", F.lit("open"))
+
+    df_days_since_prev_trans = df_days_since_prev_trans.drop("n_trans")
+
+    df_closed_dates = df_days_since_prev_trans.filter(
+        "days_since_last_trans >= 30"
+    ).select(
+        F.col("shop_id"),
+        (F.date_add(F.col("prev_trans_date"), 1)).alias(
+            "curr_trans_date"
+        ),  # date the closed period began
+        (F.date_sub(F.col("curr_trans_date"), 1)).alias(
+            "prev_trans_date"
+        ),  # date the closed period ended
+        F.lit("closed").alias("status"),
+        F.lit(0).alias("days_since_last_trans"),
     )
 
-    df_open_or_closed = df_days_since_prev_trans.withColumn(
-        "status",
-        F.when(F.col("days_since_last_trans") >= 30, "closed").otherwise("open"),
-    )
+    df_open_or_closed = df_closed_dates.unionByName(df_days_since_prev_trans)
 
     df_status_change = df_open_or_closed.withColumn(
         "prev_status", F.lag(F.col("status")).over(windowSpec)
@@ -54,11 +67,16 @@ def main():
         "max_status_change_streak",
         F.max(F.col("status_change_streak")).over(streakWindow),
     )
-    df_valid_from = df_max_status_change_indicated.groupBy(
+
+    df_lead_trans_date = df_max_status_change_indicated.withColumn(
+        "next_trans_date", F.lead("curr_trans_date").over(windowSpec)
+    )
+
+    df_valid_from = df_lead_trans_date.groupBy(
         "shop_id", "status", "status_change_streak", "max_status_change_streak"
     ).agg(
         F.min(F.col("curr_trans_date")).alias("valid_from"),
-        F.max(F.col("curr_trans_date")).alias("valid_to_temp"),
+        F.date_sub(F.max(F.col("next_trans_date")), 1).alias("valid_to_temp"),
     )
 
     df_dim_shop = df_valid_from.withColumn(
@@ -69,46 +87,50 @@ def main():
         ).otherwise((F.col("valid_to_temp"))),
     ).drop("valid_to_temp", "status_change_streak", "max_status_change_streak")
 
-    # df_dim_shop.filter("shop_id = 9 or shop_id = 5").orderBy("shop_id","valid_from").show(500)
-
     ## At this stage, dim_shop can be written to a table and is a complete SCD 2 table
-    df_dim_shop.orderBy("shop_id", "valid_from").show(55000)
+    df_dim_shop.orderBy("shop_id", "valid_from").show(200)
 
     ## Answer to a)
 
-    df_dim_shop.filter("status = 'closed'").select(F.count_distinct("shop_id")).show()
+    df_dim_shop.filter("status = 'closed'").select(
+        F.count_distinct("shop_id").alias("shops_that_had_closed_periods")
+    ).show()
 
     ## Answer to b)
 
     quarters_data = [
-        ('Q1 2021', '2021-01-01'),
-        ('Q2 2021', '2021-04-01'),
-        ('Q3 2021', '2021-07-01'),
-        ('Q4 2021', '2021-10-01'),
-        ('Q1 2022', '2022-01-01'),
-        ('Q2 2022', '2022-04-01'),
-        ('Q3 2022', '2022-07-01'),
-        ('Q4 2022', '2022-10-01')
+        ("Q1 2021", "2021-01-01"),
+        ("Q2 2021", "2021-04-01"),
+        ("Q3 2021", "2021-07-01"),
+        ("Q4 2021", "2021-10-01"),
+        ("Q1 2022", "2022-01-01"),
+        ("Q2 2022", "2022-04-01"),
+        ("Q3 2022", "2022-07-01"),
+        ("Q4 2022", "2022-10-01"),
     ]
 
-    quarters_df = spark.createDataFrame(quarters_data, ['quarter', 'q_start'])
+    quarters_df = spark.createDataFrame(quarters_data, ["quarter", "q_start"])
 
-    quarters_df = quarters_df.withColumn("q_start", F.to_date(quarters_df.q_start, "yyyy-MM-dd"))
+    quarters_df = quarters_df.withColumn(
+        "q_start", F.to_date(quarters_df.q_start, "yyyy-MM-dd")
+    )
 
     s = df_dim_shop.alias("s")
     q = quarters_df.alias("q")
 
-    df_status_at_quarter_start = s.join(q, 
-        (q.q_start >= s.valid_from) & 
-        (q.q_start <= s.valid_to)
-    , how="inner")
+    df_status_at_quarter_start = s.join(
+        q, (q.q_start >= s.valid_from) & (q.q_start <= s.valid_to), how="inner"
+    )
 
-    df_stores_open_at_quarter_start = df_status_at_quarter_start.filter("status = 'open'")
+    df_stores_open_at_quarter_start = df_status_at_quarter_start.filter(
+        "status = 'open'"
+    )
 
-    df_stores_open_at_quarter_start.groupBy("q_start").count().show()
+    df_stores_open_at_quarter_start.groupBy("q_start").agg(
+        F.count("*").alias("num_shops_open")
+    ).show()
 
 
 if __name__ == "__main__":
 
     main()
- 
